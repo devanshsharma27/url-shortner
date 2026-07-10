@@ -1,0 +1,13 @@
+node_modules/
+dist/
+.env
+*.log
+.cph/
+
+
+
+/src/generated/prisma
+
+/src/generated/prisma
+
+/src/generated/prisma
