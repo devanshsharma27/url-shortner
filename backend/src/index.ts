@@ -18,7 +18,6 @@ app.use(express.json());
 
 // ================= AUTH MIDDLEWARE =================
 
-// Extend Express's Request type so TypeScript allows req.userId
 interface AuthRequest extends express.Request {
   userId?: number;
 }
@@ -101,15 +100,41 @@ app.post("/api/auth/login", async (req, res) => {
 
 // ================= URL ROUTES =================
 
-// List all URLs (we'll make this per-user later)
-app.get("/api/urls", async (req, res) => {
-  const urls = await prisma.url.findMany({
-    orderBy: { createdAt: "desc" },
+// List MY URLs — paginated + searchable
+app.get("/api/urls", requireAuth, async (req: AuthRequest, res) => {
+  const page = Math.max(1, parseInt(String(req.query.page ?? "1"), 10) || 1);
+  const limit = Math.min(50, Math.max(1, parseInt(String(req.query.limit ?? "10"), 10) || 10));
+  const search = String(req.query.search ?? "");
+
+  const where = {
+    userId: req.userId,
+    ...(search && {
+      longUrl: { contains: search, mode: "insensitive" as const },
+    }),
+  };
+
+  const [urls, total] = await Promise.all([
+    prisma.url.findMany({
+      where,
+      orderBy: { createdAt: "desc" },
+      skip: (page - 1) * limit,
+      take: limit,
+    }),
+    prisma.url.count({ where }),
+  ]);
+
+  res.json({
+    data: urls,
+    pagination: {
+      page,
+      limit,
+      total,
+      totalPages: Math.ceil(total / limit),
+    },
   });
-  res.json(urls);
 });
 
-// Create a short URL — PROTECTED: requires a valid token
+// Create a short URL — protected, owned by the requester
 app.post("/api/urls", requireAuth, async (req: AuthRequest, res) => {
   const { longUrl } = req.body;
 
@@ -127,6 +152,59 @@ app.post("/api/urls", requireAuth, async (req: AuthRequest, res) => {
     ...record,
     shortUrl: `http://localhost:${PORT}/${shortCode}`,
   });
+});
+
+// Delete a URL — protected + ownership check
+app.delete("/api/urls/:id", requireAuth, async (req: AuthRequest, res) => {
+  const id = parseInt(String(req.params.id), 10);
+
+  if (isNaN(id)) {
+    return res.status(400).json({ error: "invalid id" });
+  }
+
+  const record = await prisma.url.findUnique({ where: { id } });
+
+  if (!record) {
+    return res.status(404).json({ error: "URL not found" });
+  }
+
+  if (record.userId !== req.userId) {
+    return res.status(403).json({ error: "you do not own this URL" });
+  }
+
+  await prisma.url.delete({ where: { id } });
+
+  res.status(204).send();
+});
+
+// Edit a URL's destination — protected + ownership check
+app.patch("/api/urls/:id", requireAuth, async (req: AuthRequest, res) => {
+  const id = parseInt(String(req.params.id), 10);
+  const { longUrl } = req.body;
+
+  if (isNaN(id)) {
+    return res.status(400).json({ error: "invalid id" });
+  }
+  if (!longUrl) {
+    return res.status(400).json({ error: "longUrl is required" });
+  }
+
+  const record = await prisma.url.findUnique({ where: { id } });
+
+  if (!record) {
+    return res.status(404).json({ error: "URL not found" });
+  }
+
+  if (record.userId !== req.userId) {
+    return res.status(403).json({ error: "you do not own this URL" });
+  }
+
+  const updated = await prisma.url.update({
+    where: { id },
+    data: { longUrl },
+  });
+
+  res.json(updated);
 });
 
 // Redirect — public, stays last (catch-all)
