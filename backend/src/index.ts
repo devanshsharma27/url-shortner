@@ -3,20 +3,21 @@ import { nanoid } from "nanoid";
 import { PrismaClient } from "@prisma/client";
 import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
-import Redis from "ioredis";                    // NEW
+import Redis from "ioredis";
 
 const app = express();
 const PORT = 3000;
 const prisma = new PrismaClient();
 
-// NEW: connect to Redis (localhost:6379 = our container)
 const redis = new Redis({ host: "localhost", port: 6379 });
-const CACHE_TTL_SECONDS = 3600; // 1 hour
+const CACHE_TTL_SECONDS = 3600;
 
 const JWT_SECRET: string = process.env.JWT_SECRET ?? "";
 if (!JWT_SECRET) {
   throw new Error("JWT_SECRET is not set in .env");
 }
+
+const REFRESH_TOKEN_DAYS = 7;
 
 app.use(express.json());
 
@@ -46,6 +47,20 @@ function requireAuth(
   } catch {
     return res.status(401).json({ error: "invalid or expired token" });
   }
+}
+
+// NEW: helper — create both tokens for a user
+async function issueTokens(userId: number) {
+  const accessToken = jwt.sign({ userId }, JWT_SECRET, { expiresIn: "15m" });
+
+  const refreshToken = nanoid(64);
+  const expiresAt = new Date(Date.now() + REFRESH_TOKEN_DAYS * 24 * 60 * 60 * 1000);
+
+  await prisma.refreshToken.create({
+    data: { token: refreshToken, userId, expiresAt },
+  });
+
+  return { accessToken, refreshToken };
 }
 
 // ================= HEALTH =================
@@ -97,9 +112,52 @@ app.post("/api/auth/login", async (req, res) => {
     return res.status(401).json({ error: "invalid credentials" });
   }
 
-  const token = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: "15m" });
+  const tokens = await issueTokens(user.id);          // CHANGED
 
-  res.json({ token });
+  res.json(tokens);                                    // { accessToken, refreshToken }
+});
+
+// NEW: exchange a refresh token for fresh tokens (with rotation)
+app.post("/api/auth/refresh", async (req, res) => {
+  const { refreshToken } = req.body;
+
+  if (!refreshToken) {
+    return res.status(400).json({ error: "refreshToken is required" });
+  }
+
+  const stored = await prisma.refreshToken.findUnique({
+    where: { token: refreshToken },
+  });
+
+  if (!stored) {
+    return res.status(401).json({ error: "invalid refresh token" });
+  }
+
+  if (stored.expiresAt < new Date()) {
+    await prisma.refreshToken.delete({ where: { id: stored.id } });
+    return res.status(401).json({ error: "refresh token expired" });
+  }
+
+  // ROTATION: old token dies, new pair is issued
+  await prisma.refreshToken.delete({ where: { id: stored.id } });
+  const tokens = await issueTokens(stored.userId);
+
+  res.json(tokens);
+});
+
+// NEW: logout — revoke the refresh token server-side
+app.post("/api/auth/logout", async (req, res) => {
+  const { refreshToken } = req.body;
+
+  if (!refreshToken) {
+    return res.status(400).json({ error: "refreshToken is required" });
+  }
+
+  await prisma.refreshToken.deleteMany({
+    where: { token: refreshToken },
+  });
+
+  res.status(204).send();
 });
 
 // ================= URL ROUTES =================
@@ -175,7 +233,7 @@ app.delete("/api/urls/:id", requireAuth, async (req: AuthRequest, res) => {
 
   await prisma.url.delete({ where: { id } });
 
-  await redis.del(`url:${record.shortCode}`);   // NEW: invalidate cache
+  await redis.del(`url:${record.shortCode}`);
 
   res.status(204).send();
 });
@@ -206,27 +264,24 @@ app.patch("/api/urls/:id", requireAuth, async (req: AuthRequest, res) => {
     data: { longUrl },
   });
 
-  await redis.del(`url:${record.shortCode}`);   // NEW: invalidate cache
+  await redis.del(`url:${record.shortCode}`);
 
   res.json(updated);
 });
 
-// Redirect — NOW CACHED (cache-aside pattern)
+// Redirect — cached
 app.get("/:code", async (req, res) => {
   const { code } = req.params;
   const cacheKey = `url:${code}`;
 
-  // 1. Try the cache first
   const cached = await redis.get(cacheKey);
   if (cached) {
-    // Cache HIT — no Postgres needed. Count the click, redirect.
     prisma.url
       .update({ where: { shortCode: code }, data: { clicks: { increment: 1 } } })
       .catch(() => {});
     return res.redirect(302, cached);
   }
 
-  // 2. Cache MISS — ask Postgres
   const record = await prisma.url.findUnique({
     where: { shortCode: code },
   });
@@ -235,7 +290,6 @@ app.get("/:code", async (req, res) => {
     return res.status(404).json({ error: "Short URL not found" });
   }
 
-  // 3. Store in cache for next time (with TTL)
   await redis.set(cacheKey, record.longUrl, "EX", CACHE_TTL_SECONDS);
 
   await prisma.url.update({
